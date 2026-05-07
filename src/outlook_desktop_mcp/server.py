@@ -510,9 +510,10 @@ async def create_draft(
             reply_to_entry_id is set (recipients come from the original mail).
             REQUIRED when forward_entry_id is set — forwards do not auto-fill
             recipients.
-        subject: Email subject line. Ignored when reply_to_entry_id or
-            forward_entry_id is set (the "RE: ..." / "FW: ..." subject is
-            preserved automatically).
+        subject: Email subject line. Ignored when reply_to_entry_id is set
+            (the "RE: ..." subject is preserved for proper threading).
+            For forwards: if provided, OVERRIDES the auto-generated
+            "FW: ..." / "WG: ..." subject; if empty, the auto subject is kept.
         body: Plain-text body of the email. Used when html_body is not provided.
         cc: CC recipients, semicolon-separated.
         bcc: BCC recipients, semicolon-separated.
@@ -581,6 +582,9 @@ async def create_draft(
                     mail.CC = cc
                 if bcc:
                     mail.BCC = bcc
+                # Allow caller to override the auto-generated "FW: ..." subject.
+                if subject:
+                    mail.Subject = subject
             else:
                 mail = original.ReplyAll() if reply_all else original.Reply()
         else:
@@ -1141,6 +1145,7 @@ async def forward_email_draft(
     to: str = "",
     cc: str = "",
     bcc: str = "",
+    subject: str = "",
     body: str = "",
     html_body: str = "",
     account: str = "",
@@ -1166,6 +1171,8 @@ async def forward_email_draft(
             if you'd rather pick recipients in the compose window.
         cc: CC recipients, semicolon-separated.
         bcc: BCC recipients, semicolon-separated.
+        subject: Optional. Overrides the auto-generated "FW: ..." / "WG: ..."
+            subject. Leave empty to keep Outlook's default forward subject.
         body: Plain-text body to prepend above the forwarded message. Used
             when html_body is not provided.
         html_body: Optional HTML body. Takes precedence over `body`.
@@ -1187,6 +1194,7 @@ async def forward_email_draft(
         to=to,
         cc=cc,
         bcc=bcc,
+        subject=subject,
         body=body,
         html_body=html_body,
         account=account,

@@ -304,8 +304,9 @@ async def create_draft(
             reply_to_entry_id is set (recipients come from the original mail).
             REQUIRED-recommended when forward_entry_id is set — forwards do
             not auto-fill recipients.
-        subject: Email subject line. Ignored when reply_to_entry_id or
-            forward_entry_id is set.
+        subject: Email subject line. Ignored when reply_to_entry_id is set.
+            For forwards: if provided, OVERRIDES the auto-generated
+            "FW: ..." / "WG: ..." subject; if empty, the default is kept.
         body: Plain-text body. Used when html_body is not provided.
         cc: CC recipients, semicolon-separated.
         bcc: BCC recipients, semicolon-separated.
@@ -412,11 +413,18 @@ end tell'''
         cc_lines = _fwd_recipient_lines(cc, "cc recipient") if cc else ""
         bcc_lines = _fwd_recipient_lines(bcc, "bcc recipient") if bcc else ""
 
+        # Allow caller to override the auto-generated "FW: ..." / "WG: ..."
+        # subject. Leave the default in place when subject is empty.
+        subject_line = (
+            f'set subject of fwdMsg to "{escape(subject)}"\n    '
+            if subject else ""
+        )
+
         script = f'''tell application "Microsoft Outlook"
     set m to message id {escape(forward_entry_id)}
     set fwdMsg to forward m
     set content of fwdMsg to "{escape(user_text)}" & return & return & {sig_block}content of fwdMsg
-    {to_lines}{cc_lines}{bcc_lines}set msgId to id of fwdMsg
+    {subject_line}{to_lines}{cc_lines}{bcc_lines}set msgId to id of fwdMsg
     return msgId
 end tell'''
         try:
@@ -424,7 +432,7 @@ end tell'''
             return json.dumps({
                 "status": "draft_created",
                 "message_id": msg_id,
-                "subject": "(forward draft)",
+                "subject": subject or "(forward draft)",
                 "is_reply": False,
                 "is_forward": True,
             })
@@ -964,6 +972,7 @@ async def forward_email_draft(
     to: str = "",
     cc: str = "",
     bcc: str = "",
+    subject: str = "",
     body: str = "",
     html_body: str = "",
     display: bool = True,
@@ -985,6 +994,8 @@ async def forward_email_draft(
             you'd rather pick recipients in the compose window.
         cc: CC recipients, semicolon-separated.
         bcc: BCC recipients, semicolon-separated.
+        subject: Optional. Overrides the auto-generated "FW: ..." / "WG: ..."
+            subject. Leave empty to keep Outlook's default forward subject.
         body: Plain-text body to prepend above the forwarded message. Used
             when html_body is not provided.
         html_body: Optional HTML body. Takes precedence over `body`.
@@ -1002,6 +1013,7 @@ async def forward_email_draft(
         to=to,
         cc=cc,
         bcc=bcc,
+        subject=subject,
         body=body,
         html_body=html_body,
         forward_entry_id=entry_id,
