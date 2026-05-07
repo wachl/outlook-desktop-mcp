@@ -287,20 +287,25 @@ async def create_draft(
     html_body: str = "",
     reply_to_entry_id: str = "",
     reply_all: bool = False,
+    forward_entry_id: str = "",
     signature: str = "",
     include_signature: bool = True,
 ) -> str:
     """Save an email as a draft in Outlook without sending it.
 
-    Can create a fresh standalone draft, OR a draft REPLY to an existing email
-    (preserving the conversation thread, recipients, and quoted message body).
+    Can create a fresh standalone draft, a draft REPLY to an existing email
+    (preserving the conversation thread, recipients, and quoted message body),
+    or a draft FORWARD of an existing email (with the original embedded below).
     Optionally inserts a signature: either the user's default signature, or a
     named signature. Use `list_signatures` to discover available signatures.
 
     Args:
         to: Recipient email addresses, semicolon-separated. Ignored when
             reply_to_entry_id is set (recipients come from the original mail).
-        subject: Email subject line. Ignored when reply_to_entry_id is set.
+            REQUIRED-recommended when forward_entry_id is set — forwards do
+            not auto-fill recipients.
+        subject: Email subject line. Ignored when reply_to_entry_id or
+            forward_entry_id is set.
         body: Plain-text body. Used when html_body is not provided.
         cc: CC recipients, semicolon-separated.
         bcc: BCC recipients, semicolon-separated.
@@ -308,6 +313,9 @@ async def create_draft(
         reply_to_entry_id: If provided, creates a draft REPLY to this email.
             The draft is properly threaded and the quoted original is preserved.
         reply_all: When replying, if True replies to all recipients (To + CC).
+        forward_entry_id: If provided, creates a draft FORWARD of this email
+            with the original embedded. Mutually exclusive with
+            reply_to_entry_id. Supply `to`/`cc`/`bcc` for forward recipients.
         signature: Name of a specific Outlook signature to insert. Use
             `list_signatures` to see available names. If empty and
             include_signature is True, the default signature is used.
@@ -316,6 +324,11 @@ async def create_draft(
     Returns:
         JSON with message_id and subject on success, or an error string.
     """
+    if reply_to_entry_id and forward_entry_id:
+        return (
+            "Error creating draft: reply_to_entry_id and forward_entry_id "
+            "are mutually exclusive — pass only one."
+        )
     def _recipient_lines(addresses: str, kind: str) -> str:
         lines = ""
         for addr in addresses.split(";"):
@@ -374,6 +387,46 @@ end tell'''
                 "message_id": msg_id,
                 "subject": "(reply draft)",
                 "is_reply": True,
+                "is_forward": False,
+            })
+        except Exception as e:
+            return f"Error creating draft: {e}"
+
+    if forward_entry_id:
+        # Build a draft forward: AppleScript `forward` creates the forward
+        # object with the original embedded; we set recipients and content
+        # WITHOUT calling `send`.
+        user_text = html_body or body or ""
+        sig_block = f'"{escape(sig_content)}" & return & return & ' if sig_content else ""
+
+        # Build recipient lines targeting the forward object name `fwdMsg`.
+        def _fwd_recipient_lines(addresses: str, kind: str) -> str:
+            lines = ""
+            for addr in addresses.split(";"):
+                addr = addr.strip()
+                if addr:
+                    lines += f'make new {kind} at fwdMsg with properties {{email address:{{address:"{escape(addr)}"}}}}\n'
+            return lines
+
+        to_lines = _fwd_recipient_lines(to, "to recipient") if to else ""
+        cc_lines = _fwd_recipient_lines(cc, "cc recipient") if cc else ""
+        bcc_lines = _fwd_recipient_lines(bcc, "bcc recipient") if bcc else ""
+
+        script = f'''tell application "Microsoft Outlook"
+    set m to message id {escape(forward_entry_id)}
+    set fwdMsg to forward m
+    set content of fwdMsg to "{escape(user_text)}" & return & return & {sig_block}content of fwdMsg
+    {to_lines}{cc_lines}{bcc_lines}set msgId to id of fwdMsg
+    return msgId
+end tell'''
+        try:
+            msg_id = (await bridge.run(script)).strip()
+            return json.dumps({
+                "status": "draft_created",
+                "message_id": msg_id,
+                "subject": "(forward draft)",
+                "is_reply": False,
+                "is_forward": True,
             })
         except Exception as e:
             return f"Error creating draft: {e}"
@@ -407,6 +460,7 @@ end tell'''
             "message_id": msg_id,
             "subject": subject or "(no subject)",
             "is_reply": False,
+            "is_forward": False,
         })
     except Exception as e:
         return f"Error creating draft: {e}"
@@ -876,6 +930,81 @@ async def reply_email_draft(
         html_body=html_body,
         reply_to_entry_id=entry_id,
         reply_all=reply_all,
+        signature=signature,
+        include_signature=include_signature,
+    )
+
+    # Optionally open the draft in Outlook for editing
+    if display:
+        try:
+            payload = json.loads(result)
+            msg_id = payload.get("message_id", "")
+            if msg_id:
+                open_script = f'''tell application "Microsoft Outlook"
+    activate
+    open message id {escape(msg_id)}
+end tell'''
+                try:
+                    await bridge.run(open_script)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return result
+
+
+# =====================================================================
+# TOOL 7c: forward_email_draft
+# =====================================================================
+
+@mcp.tool()
+async def forward_email_draft(
+    entry_id: str,
+    to: str = "",
+    cc: str = "",
+    bcc: str = "",
+    body: str = "",
+    html_body: str = "",
+    display: bool = True,
+    signature: str = "",
+    include_signature: bool = True,
+) -> str:
+    """Create a draft FORWARD without sending — opens it in Outlook for review.
+
+    Forwards an existing email as a draft. The original message is embedded
+    below your new content. Recipients are NOT auto-populated — supply them
+    via `to` / `cc` / `bcc`. Optionally opens the compose window so you can
+    adjust before clicking Send yourself.
+
+    This is a focused wrapper around create_draft for the forward use case.
+
+    Args:
+        entry_id: The numeric ID of the email to forward.
+        to: Recipient email addresses, semicolon-separated. May be empty if
+            you'd rather pick recipients in the compose window.
+        cc: CC recipients, semicolon-separated.
+        bcc: BCC recipients, semicolon-separated.
+        body: Plain-text body to prepend above the forwarded message. Used
+            when html_body is not provided.
+        html_body: Optional HTML body. Takes precedence over `body`.
+        display: If True (default), opens the draft in Outlook so you can
+            edit before sending.
+        signature: Name of a specific signature to insert. Use list_signatures
+            to see available names. If empty and include_signature is True,
+            the first available signature is used as a default.
+        include_signature: If True (default), append the signature to the draft.
+
+    Returns:
+        JSON with message_id and is_forward on success, or an error string.
+    """
+    result = await create_draft(
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        body=body,
+        html_body=html_body,
+        forward_entry_id=entry_id,
         signature=signature,
         include_signature=include_signature,
     )

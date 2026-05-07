@@ -484,6 +484,7 @@ async def create_draft(
     display: bool = True,
     reply_to_entry_id: str = "",
     reply_all: bool = False,
+    forward_entry_id: str = "",
     signature: str = "",
     include_signature: bool = True,
     font_name: str = "",
@@ -491,8 +492,9 @@ async def create_draft(
 ) -> str:
     """Save an email as a draft in Outlook without sending it.
 
-    Can create a fresh standalone draft, OR a draft REPLY to an existing email
-    (preserving the conversation thread, recipients, and quoted message body).
+    Can create a fresh standalone draft, a draft REPLY to an existing email
+    (preserving the conversation thread, recipients, and quoted message body),
+    or a draft FORWARD of an existing email (with the original embedded below).
     Optionally inserts a signature: either the account's default signature, or
     a named signature from the user's Outlook signature folder. Use
     `list_signatures` to discover available signature names.
@@ -506,8 +508,11 @@ async def create_draft(
     Args:
         to: Recipient email addresses, semicolon-separated. Ignored when
             reply_to_entry_id is set (recipients come from the original mail).
-        subject: Email subject line. Ignored when reply_to_entry_id is set
-            (the original "RE: ..." subject is preserved).
+            REQUIRED when forward_entry_id is set — forwards do not auto-fill
+            recipients.
+        subject: Email subject line. Ignored when reply_to_entry_id or
+            forward_entry_id is set (the "RE: ..." / "FW: ..." subject is
+            preserved automatically).
         body: Plain-text body of the email. Used when html_body is not provided.
         cc: CC recipients, semicolon-separated.
         bcc: BCC recipients, semicolon-separated.
@@ -522,6 +527,11 @@ async def create_draft(
             preserved below your new content.
         reply_all: When replying, if True replies to all recipients (To + CC).
             Default False replies only to the original sender.
+        forward_entry_id: If provided, creates a draft FORWARD of this email.
+            The draft has the original message embedded (as Outlook normally
+            renders forwards) and forwarded attachments preserved. Mutually
+            exclusive with reply_to_entry_id. You must supply `to` (and
+            optionally cc/bcc) for the forward.
         signature: Name of a specific signature to insert (without file
             extension). Use `list_signatures` to see what's available. If empty
             and include_signature is True, the account's default signature
@@ -534,25 +544,45 @@ async def create_draft(
             Leave 0 to use whatever Outlook's compose template provides.
 
     Returns:
-        JSON with entry_id, subject, and is_reply on success, or an error string.
+        JSON with entry_id, subject, is_reply, and is_forward on success,
+        or an error string.
     """
+    if reply_to_entry_id and forward_entry_id:
+        return (
+            "Error creating draft: reply_to_entry_id and forward_entry_id "
+            "are mutually exclusive — pass only one."
+        )
+
     def _create_draft(
         outlook, namespace, to, subject, body, cc, bcc, html_body,
-        account, display, reply_to_entry_id, reply_all, signature, include_signature,
-        font_name, font_size,
+        account, display, reply_to_entry_id, reply_all, forward_entry_id,
+        signature, include_signature, font_name, font_size,
     ):
         is_reply = bool(reply_to_entry_id)
+        is_forward = bool(forward_entry_id)
+        has_quoted_body = is_reply or is_forward
 
-        # ---- 1. Create the mail item: either a reply or a fresh item ----
-        if is_reply:
+        # ---- 1. Create the mail item: reply, forward, or fresh ----
+        if has_quoted_body:
+            src_id = reply_to_entry_id or forward_entry_id
             if account:
                 store = _require_store(namespace, account)
-                original = namespace.GetItemFromID(reply_to_entry_id, store.StoreID)
+                original = namespace.GetItemFromID(src_id, store.StoreID)
             else:
-                original = namespace.GetItemFromID(reply_to_entry_id)
+                original = namespace.GetItemFromID(src_id)
             if err := _check_item_class(original, _OL_CLASS_MAIL, "mail item"):
                 return err
-            mail = original.ReplyAll() if reply_all else original.Reply()
+            if is_forward:
+                mail = original.Forward()
+                # Forwards do NOT auto-populate recipients — apply user inputs.
+                if to:
+                    mail.To = to
+                if cc:
+                    mail.CC = cc
+                if bcc:
+                    mail.BCC = bcc
+            else:
+                mail = original.ReplyAll() if reply_all else original.Reply()
         else:
             mail = outlook.CreateItem(OL_MAIL_ITEM)
             if account:
@@ -614,13 +644,13 @@ async def create_draft(
                 inspector_loaded = False
 
         # ---- 6. Compose the final HTMLBody ──────────────────────────────
-        # Layout cases:
-        #   named sig + reply  : [user][named_sig] injected ABOVE quoted text
-        #   named sig + new    : [user][named_sig]
-        #   default sig + reply: [user] injected ABOVE [default_sig + quoted]
-        #   default sig + new  : [user] injected ABOVE [default_sig]
-        #   no sig + reply     : [user] injected ABOVE [quoted]
-        #   no sig + new       : [user]
+        # Layout cases (reply/forward share "quoted body" semantics):
+        #   named sig + reply/fwd : [user][named_sig] injected ABOVE quoted text
+        #   named sig + new       : [user][named_sig]
+        #   default sig + reply/fwd: [user] injected ABOVE [default_sig + quoted]
+        #   default sig + new     : [user] injected ABOVE [default_sig]
+        #   no sig + reply/fwd    : [user] injected ABOVE [quoted]
+        #   no sig + new          : [user]
         post_inspector_html = mail.HTMLBody or ""
 
         if include_signature and signature:
@@ -629,7 +659,7 @@ async def create_draft(
             # that GetInspector inserted.  Use the pre-inspector HTML instead,
             # which holds only the quoted text (or is empty for new mails).
             combined_top = user_html + named_sig_html
-            if is_reply:
+            if has_quoted_body:
                 mail.HTMLBody = _inject_after_body_tag(pre_inspector_html, combined_top)
             else:
                 mail.HTMLBody = combined_top if combined_top else post_inspector_html
@@ -642,7 +672,7 @@ async def create_draft(
         else:
             # NO signature (include_signature=False).  Discard whatever the
             # inspector inserted and rebuild from the pre-inspector HTML.
-            if is_reply:
+            if has_quoted_body:
                 base = pre_inspector_html
                 if user_html:
                     mail.HTMLBody = _inject_after_body_tag(base, user_html)
@@ -672,13 +702,14 @@ async def create_draft(
             "entry_id": mail.EntryID,
             "subject": mail.Subject or "(no subject)",
             "is_reply": is_reply,
+            "is_forward": is_forward,
         })
 
     try:
         return await bridge.call(
             _create_draft, to, subject, body, cc, bcc, html_body, account, display,
-            reply_to_entry_id, reply_all, signature, include_signature,
-            font_name, font_size,
+            reply_to_entry_id, reply_all, forward_entry_id, signature,
+            include_signature, font_name, font_size,
         )
     except Exception as e:
         return f"Error creating draft: {format_com_error(e)}"
@@ -1093,6 +1124,74 @@ async def reply_email_draft(
         display=display,
         reply_to_entry_id=entry_id,
         reply_all=reply_all,
+        signature=signature,
+        include_signature=include_signature,
+        font_name=font_name,
+        font_size=font_size,
+    )
+
+
+# =====================================================================
+# TOOL 7c: forward_email_draft
+# =====================================================================
+
+@mcp.tool()
+async def forward_email_draft(
+    entry_id: str,
+    to: str = "",
+    cc: str = "",
+    bcc: str = "",
+    body: str = "",
+    html_body: str = "",
+    account: str = "",
+    display: bool = True,
+    signature: str = "",
+    include_signature: bool = True,
+    font_name: str = "",
+    font_size: int = 0,
+) -> str:
+    """Create a draft FORWARD without sending — opens it in Outlook for review.
+
+    Forwards an existing email as a draft. The original message (and any
+    attachments Outlook normally carries on a forward) is embedded below
+    your new content. Recipients are NOT auto-populated — supply them via
+    `to` / `cc` / `bcc`. Optionally opens the compose window so you can
+    adjust before clicking Send yourself.
+
+    This is a focused wrapper around create_draft for the forward use case.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the email to forward.
+        to: Recipient email addresses, semicolon-separated. May be left empty
+            if you'd rather pick recipients in the compose window.
+        cc: CC recipients, semicolon-separated.
+        bcc: BCC recipients, semicolon-separated.
+        body: Plain-text body to prepend above the forwarded message. Used
+            when html_body is not provided.
+        html_body: Optional HTML body. Takes precedence over `body`.
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+        display: If True (default), opens the draft in Outlook's compose
+            window so you can edit before sending.
+        signature: Name of a specific signature to insert. Use list_signatures
+            to see available names. If empty and include_signature is True,
+            the account's default signature is used.
+        include_signature: If True (default), append the signature to the draft.
+        font_name: Override the body font-family (e.g. "Arial", "Calibri").
+        font_size: Override the body font size in points (e.g. 10, 11, 12).
+
+    Returns:
+        JSON with entry_id, subject, and is_forward on success, or an error.
+    """
+    return await create_draft(
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        body=body,
+        html_body=html_body,
+        account=account,
+        display=display,
+        forward_entry_id=entry_id,
         signature=signature,
         include_signature=include_signature,
         font_name=font_name,
