@@ -484,6 +484,7 @@ async def create_draft(
     display: bool = True,
     reply_to_entry_id: str = "",
     reply_all: bool = False,
+    forward_entry_id: str = "",
     signature: str = "",
     include_signature: bool = True,
     font_name: str = "",
@@ -491,8 +492,9 @@ async def create_draft(
 ) -> str:
     """Save an email as a draft in Outlook without sending it.
 
-    Can create a fresh standalone draft, OR a draft REPLY to an existing email
-    (preserving the conversation thread, recipients, and quoted message body).
+    Can create a fresh standalone draft, a draft REPLY to an existing email
+    (preserving the conversation thread, recipients, and quoted message body),
+    or a draft FORWARD of an existing email (with the original embedded below).
     Optionally inserts a signature: either the account's default signature, or
     a named signature from the user's Outlook signature folder. Use
     `list_signatures` to discover available signature names.
@@ -506,8 +508,12 @@ async def create_draft(
     Args:
         to: Recipient email addresses, semicolon-separated. Ignored when
             reply_to_entry_id is set (recipients come from the original mail).
+            REQUIRED when forward_entry_id is set — forwards do not auto-fill
+            recipients.
         subject: Email subject line. Ignored when reply_to_entry_id is set
-            (the original "RE: ..." subject is preserved).
+            (the "RE: ..." subject is preserved for proper threading).
+            For forwards: if provided, OVERRIDES the auto-generated
+            "FW: ..." / "WG: ..." subject; if empty, the auto subject is kept.
         body: Plain-text body of the email. Used when html_body is not provided.
         cc: CC recipients, semicolon-separated.
         bcc: BCC recipients, semicolon-separated.
@@ -522,6 +528,11 @@ async def create_draft(
             preserved below your new content.
         reply_all: When replying, if True replies to all recipients (To + CC).
             Default False replies only to the original sender.
+        forward_entry_id: If provided, creates a draft FORWARD of this email.
+            The draft has the original message embedded (as Outlook normally
+            renders forwards) and forwarded attachments preserved. Mutually
+            exclusive with reply_to_entry_id. You must supply `to` (and
+            optionally cc/bcc) for the forward.
         signature: Name of a specific signature to insert (without file
             extension). Use `list_signatures` to see what's available. If empty
             and include_signature is True, the account's default signature
@@ -534,25 +545,48 @@ async def create_draft(
             Leave 0 to use whatever Outlook's compose template provides.
 
     Returns:
-        JSON with entry_id, subject, and is_reply on success, or an error string.
+        JSON with entry_id, subject, is_reply, and is_forward on success,
+        or an error string.
     """
+    if reply_to_entry_id and forward_entry_id:
+        return (
+            "Error creating draft: reply_to_entry_id and forward_entry_id "
+            "are mutually exclusive — pass only one."
+        )
+
     def _create_draft(
         outlook, namespace, to, subject, body, cc, bcc, html_body,
-        account, display, reply_to_entry_id, reply_all, signature, include_signature,
-        font_name, font_size,
+        account, display, reply_to_entry_id, reply_all, forward_entry_id,
+        signature, include_signature, font_name, font_size,
     ):
         is_reply = bool(reply_to_entry_id)
+        is_forward = bool(forward_entry_id)
+        has_quoted_body = is_reply or is_forward
 
-        # ---- 1. Create the mail item: either a reply or a fresh item ----
-        if is_reply:
+        # ---- 1. Create the mail item: reply, forward, or fresh ----
+        if has_quoted_body:
+            src_id = reply_to_entry_id or forward_entry_id
             if account:
                 store = _require_store(namespace, account)
-                original = namespace.GetItemFromID(reply_to_entry_id, store.StoreID)
+                original = namespace.GetItemFromID(src_id, store.StoreID)
             else:
-                original = namespace.GetItemFromID(reply_to_entry_id)
+                original = namespace.GetItemFromID(src_id)
             if err := _check_item_class(original, _OL_CLASS_MAIL, "mail item"):
                 return err
-            mail = original.ReplyAll() if reply_all else original.Reply()
+            if is_forward:
+                mail = original.Forward()
+                # Forwards do NOT auto-populate recipients — apply user inputs.
+                if to:
+                    mail.To = to
+                if cc:
+                    mail.CC = cc
+                if bcc:
+                    mail.BCC = bcc
+                # Allow caller to override the auto-generated "FW: ..." subject.
+                if subject:
+                    mail.Subject = subject
+            else:
+                mail = original.ReplyAll() if reply_all else original.Reply()
         else:
             mail = outlook.CreateItem(OL_MAIL_ITEM)
             if account:
@@ -614,13 +648,13 @@ async def create_draft(
                 inspector_loaded = False
 
         # ---- 6. Compose the final HTMLBody ──────────────────────────────
-        # Layout cases:
-        #   named sig + reply  : [user][named_sig] injected ABOVE quoted text
-        #   named sig + new    : [user][named_sig]
-        #   default sig + reply: [user] injected ABOVE [default_sig + quoted]
-        #   default sig + new  : [user] injected ABOVE [default_sig]
-        #   no sig + reply     : [user] injected ABOVE [quoted]
-        #   no sig + new       : [user]
+        # Layout cases (reply/forward share "quoted body" semantics):
+        #   named sig + reply/fwd : [user][named_sig] injected ABOVE quoted text
+        #   named sig + new       : [user][named_sig]
+        #   default sig + reply/fwd: [user] injected ABOVE [default_sig + quoted]
+        #   default sig + new     : [user] injected ABOVE [default_sig]
+        #   no sig + reply/fwd    : [user] injected ABOVE [quoted]
+        #   no sig + new          : [user]
         post_inspector_html = mail.HTMLBody or ""
 
         if include_signature and signature:
@@ -629,7 +663,7 @@ async def create_draft(
             # that GetInspector inserted.  Use the pre-inspector HTML instead,
             # which holds only the quoted text (or is empty for new mails).
             combined_top = user_html + named_sig_html
-            if is_reply:
+            if has_quoted_body:
                 mail.HTMLBody = _inject_after_body_tag(pre_inspector_html, combined_top)
             else:
                 mail.HTMLBody = combined_top if combined_top else post_inspector_html
@@ -642,7 +676,7 @@ async def create_draft(
         else:
             # NO signature (include_signature=False).  Discard whatever the
             # inspector inserted and rebuild from the pre-inspector HTML.
-            if is_reply:
+            if has_quoted_body:
                 base = pre_inspector_html
                 if user_html:
                     mail.HTMLBody = _inject_after_body_tag(base, user_html)
@@ -672,13 +706,14 @@ async def create_draft(
             "entry_id": mail.EntryID,
             "subject": mail.Subject or "(no subject)",
             "is_reply": is_reply,
+            "is_forward": is_forward,
         })
 
     try:
         return await bridge.call(
             _create_draft, to, subject, body, cc, bcc, html_body, account, display,
-            reply_to_entry_id, reply_all, signature, include_signature,
-            font_name, font_size,
+            reply_to_entry_id, reply_all, forward_entry_id, signature,
+            include_signature, font_name, font_size,
         )
     except Exception as e:
         return f"Error creating draft: {format_com_error(e)}"
@@ -1043,6 +1078,136 @@ async def reply_email(
 
 
 # =====================================================================
+# TOOL 7b: reply_email_draft
+# =====================================================================
+
+@mcp.tool()
+async def reply_email_draft(
+    entry_id: str,
+    body: str = "",
+    html_body: str = "",
+    reply_all: bool = False,
+    account: str = "",
+    display: bool = True,
+    signature: str = "",
+    include_signature: bool = True,
+    font_name: str = "",
+    font_size: int = 0,
+) -> str:
+    """Create a draft REPLY without sending — opens it in Outlook for review.
+
+    Like reply_email, but saves the reply to the Drafts folder instead of
+    sending it. Optionally opens the compose window so you can adjust the
+    text, add attachments, or change recipients before clicking Send yourself.
+
+    This is a focused wrapper around create_draft for the reply use case.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the email to reply to.
+        body: Plain-text reply body. Used when html_body is not provided.
+        html_body: Optional HTML reply body. Takes precedence over `body`.
+        reply_all: If True, reply to all recipients (sender + CC). Default False.
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+        display: If True (default), opens the draft in Outlook's compose
+            window so you can edit before sending.
+        signature: Name of a specific signature to insert. Use list_signatures
+            to see available names. If empty and include_signature is True,
+            the account's default signature is used.
+        include_signature: If True (default), append the signature to the draft.
+        font_name: Override the body font-family (e.g. "Arial", "Calibri").
+        font_size: Override the body font size in points (e.g. 10, 11, 12).
+
+    Returns:
+        JSON with entry_id, subject, and is_reply on success, or an error string.
+    """
+    return await create_draft(
+        body=body,
+        html_body=html_body,
+        account=account,
+        display=display,
+        reply_to_entry_id=entry_id,
+        reply_all=reply_all,
+        signature=signature,
+        include_signature=include_signature,
+        font_name=font_name,
+        font_size=font_size,
+    )
+
+
+# =====================================================================
+# TOOL 7c: forward_email_draft
+# =====================================================================
+
+@mcp.tool()
+async def forward_email_draft(
+    entry_id: str,
+    to: str = "",
+    cc: str = "",
+    bcc: str = "",
+    subject: str = "",
+    body: str = "",
+    html_body: str = "",
+    account: str = "",
+    display: bool = True,
+    signature: str = "",
+    include_signature: bool = True,
+    font_name: str = "",
+    font_size: int = 0,
+) -> str:
+    """Create a draft FORWARD without sending — opens it in Outlook for review.
+
+    Forwards an existing email as a draft. The original message (and any
+    attachments Outlook normally carries on a forward) is embedded below
+    your new content. Recipients are NOT auto-populated — supply them via
+    `to` / `cc` / `bcc`. Optionally opens the compose window so you can
+    adjust before clicking Send yourself.
+
+    This is a focused wrapper around create_draft for the forward use case.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the email to forward.
+        to: Recipient email addresses, semicolon-separated. May be left empty
+            if you'd rather pick recipients in the compose window.
+        cc: CC recipients, semicolon-separated.
+        bcc: BCC recipients, semicolon-separated.
+        subject: Optional. Overrides the auto-generated "FW: ..." / "WG: ..."
+            subject. Leave empty to keep Outlook's default forward subject.
+        body: Plain-text body to prepend above the forwarded message. Used
+            when html_body is not provided.
+        html_body: Optional HTML body. Takes precedence over `body`.
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+        display: If True (default), opens the draft in Outlook's compose
+            window so you can edit before sending.
+        signature: Name of a specific signature to insert. Use list_signatures
+            to see available names. If empty and include_signature is True,
+            the account's default signature is used.
+        include_signature: If True (default), append the signature to the draft.
+        font_name: Override the body font-family (e.g. "Arial", "Calibri").
+        font_size: Override the body font size in points (e.g. 10, 11, 12).
+
+    Returns:
+        JSON with entry_id, subject, and is_forward on success, or an error.
+    """
+    return await create_draft(
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        subject=subject,
+        body=body,
+        html_body=html_body,
+        account=account,
+        display=display,
+        forward_entry_id=entry_id,
+        signature=signature,
+        include_signature=include_signature,
+        font_name=font_name,
+        font_size=font_size,
+    )
+
+
+# =====================================================================
 # TOOL 8: list_folders
 # =====================================================================
 
@@ -1399,6 +1564,98 @@ async def create_event(
 
 
 # =====================================================================
+# TOOL 12b: create_event_draft
+# =====================================================================
+
+@mcp.tool()
+async def create_event_draft(
+    subject: str = "",
+    start: str = "",
+    end: str = "",
+    location: str = "",
+    body: str = "",
+    all_day: bool = False,
+    reminder_minutes: int = 15,
+    account: str = "",
+    display: bool = True,
+) -> str:
+    """Create a draft personal calendar event — opens it for review/editing.
+
+    Like create_event, but does NOT save the appointment silently. Pre-fills
+    the fields you provide, then opens the appointment in Outlook so you can
+    review, adjust details (e.g. add categories, attachments, recurrence)
+    and click Save & Close yourself. Until you save it manually, the event
+    is not committed to the calendar.
+
+    No attendees are added — use create_meeting_draft if you need to invite
+    people.
+
+    Args:
+        subject: The event title. May be empty for a fully blank draft.
+        start: Start time in ISO 8601 format. Examples: "2026-02-25 14:00",
+            "2026-02-25T14:00:00". For all-day events, use just the date:
+            "2026-02-25". Leave empty to start with no time set.
+        end: End time in ISO 8601 format. For all-day events, use the next
+            day. Leave empty to start with no time set.
+        location: Optional. Event location.
+        body: Optional. Description or notes for the event.
+        all_day: If true, marks as an all-day event. Default false.
+        reminder_minutes: Minutes before the event to show a reminder.
+            Default 15. Set to 0 to disable reminder.
+        account: Optional. Account display name (or substring) to create
+            the event in. Default: primary account.
+        display: If True (default), opens the appointment window so you can
+            edit before saving. Set False to leave it unsaved in memory only
+            (rarely useful — the item is lost if Outlook is restarted).
+
+    Returns:
+        JSON with entry_id and subject of the prepared draft, or an error.
+    """
+    def _create(outlook, namespace, subject, start, end, location, body,
+                all_day, reminder_minutes, account, display):
+        appt = outlook.CreateItem(OL_APPOINTMENT_ITEM)
+        if account:
+            store = _require_store(namespace, account)
+            cal = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
+            appt.Move(cal)
+            appt = namespace.GetItemFromID(appt.EntryID)
+        if subject:
+            appt.Subject = subject
+        if start:
+            appt.Start = start
+        if end:
+            appt.End = end
+        if location:
+            appt.Location = location
+        if body:
+            appt.Body = body
+        appt.AllDayEvent = all_day
+        if reminder_minutes > 0:
+            appt.ReminderSet = True
+            appt.ReminderMinutesBeforeStart = reminder_minutes
+        else:
+            appt.ReminderSet = False
+        appt.Save()
+        if display:
+            appt.Display(False)
+        return json.dumps({
+            "status": "draft_created",
+            "entry_id": appt.EntryID,
+            "subject": appt.Subject or "(no subject)",
+            "start": str(appt.Start) if start else "",
+            "end": str(appt.End) if end else "",
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(
+            _create, subject, start, end, location, body, all_day,
+            reminder_minutes, account, display,
+        )
+    except Exception as e:
+        return f"Error creating event draft: {format_com_error(e)}"
+
+
+# =====================================================================
 # TOOL 13: create_meeting
 # =====================================================================
 
@@ -1482,6 +1739,108 @@ async def create_meeting(
         )
     except Exception as e:
         return f"Error creating meeting: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 13b: create_meeting_draft
+# =====================================================================
+
+@mcp.tool()
+async def create_meeting_draft(
+    subject: str = "",
+    start: str = "",
+    end: str = "",
+    required_attendees: str = "",
+    location: str = "",
+    body: str = "",
+    optional_attendees: str = "",
+    account: str = "",
+    display: bool = True,
+) -> str:
+    """Create a draft meeting — pre-filled but NOT sent to attendees.
+
+    Like create_meeting, but does NOT call Send(): no meeting invitations
+    leave Outlook. The meeting is saved to your calendar as an unsent
+    organizer draft and opened in the meeting compose window so you can
+    review attendees, agenda, and timing before clicking Send yourself.
+
+    Args:
+        subject: The meeting title. May be empty for a blank draft.
+        start: Start time in ISO 8601 format (e.g. "2026-02-25 14:00").
+            Leave empty to start with no time set.
+        end: End time in ISO 8601 format (e.g. "2026-02-25 15:00").
+            Leave empty to start with no time set.
+        required_attendees: Required attendee email addresses, separated by
+            semicolons. Example: "alice@example.com; bob@example.com".
+            May be empty — you can add attendees in Outlook before sending.
+        location: Optional. Meeting location (e.g. "Teams", "Room 301").
+        body: Optional. Meeting description or agenda.
+        optional_attendees: Optional. Optional attendee emails, semicolon
+            separated.
+        account: Optional. Account display name (or substring) to send from.
+            Default: primary account.
+        display: If True (default), opens the meeting compose window so you
+            can edit before sending.
+
+    Returns:
+        JSON with entry_id and subject on success, or an error.
+    """
+    def _create(outlook, namespace, subject, start, end, required_attendees,
+                location, body, optional_attendees, account, display):
+        appt = outlook.CreateItem(OL_APPOINTMENT_ITEM)
+        if account:
+            store = _require_store(namespace, account)
+            for acc in outlook.Session.Accounts:
+                if acc.DeliveryStore.StoreID == store.StoreID:
+                    appt._oleobj_.Invoke(*(64209, 0, 8, 0, acc))
+                    break
+        if subject:
+            appt.Subject = subject
+        if start:
+            appt.Start = start
+        if end:
+            appt.End = end
+        appt.MeetingStatus = OL_MEETING
+        if location:
+            appt.Location = location
+        if body:
+            appt.Body = body
+
+        for addr in required_attendees.split(";"):
+            addr = addr.strip()
+            if addr:
+                recip = appt.Recipients.Add(addr)
+                recip.Type = OL_REQUIRED
+
+        if optional_attendees:
+            for addr in optional_attendees.split(";"):
+                addr = addr.strip()
+                if addr:
+                    recip = appt.Recipients.Add(addr)
+                    recip.Type = OL_OPTIONAL
+
+        if required_attendees or optional_attendees:
+            appt.Recipients.ResolveAll()
+
+        appt.Save()
+        if display:
+            appt.Display(False)
+
+        return json.dumps({
+            "status": "draft_created",
+            "entry_id": appt.EntryID,
+            "subject": appt.Subject or "(no subject)",
+            "start": str(appt.Start) if start else "",
+            "end": str(appt.End) if end else "",
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(
+            _create, subject, start, end, required_attendees, location, body,
+            optional_attendees, account, display,
+        )
+    except Exception as e:
+        return f"Error creating meeting draft: {format_com_error(e)}"
 
 
 # =====================================================================
